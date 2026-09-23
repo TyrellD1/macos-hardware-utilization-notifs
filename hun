@@ -1,0 +1,479 @@
+#!/bin/bash
+# hun — macOS hardware utilization monitor CLI.
+# Thresholds live in ~/.macos-hun/config.json; alerts go out via `a2h`.
+# Exit codes describe the *check*, not the machine: 0 sampled fine
+# (breach or not), 1 usage/config error, 3 a2h missing, 4 send failed.
+set -u
+NL=$'\n'
+
+HUN_DIR="${HOME}/.macos-hun"
+HUN_CONFIG="${HUN_DIR}/config.json"
+HUN_STATE="${HUN_DIR}/state.json"
+HUN_LOGS="${HUN_DIR}/logs"
+HUN_AGENT_DIR="${HOME}/Library/LaunchAgents"
+HUN_LABEL="dev.macos-hun"
+
+# Resolve install root (follows the ~/.local/bin/hun symlink).
+HUN_BIN="$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+case "$HUN_BIN" in /*) ;; *) HUN_BIN="$PWD/$HUN_BIN" ;; esac
+HUN_ROOT="$(cd "$(dirname "$HUN_BIN")" && pwd)"
+[[ -d "$HUN_ROOT/lib" ]] || HUN_ROOT="$(cd "$(dirname "$HUN_BIN")/../share/macos-hun" 2>/dev/null && pwd || echo "$HUN_ROOT")"
+
+# shellcheck disable=SC1091
+[[ -f "$HUN_ROOT/lib/check.sh" ]] && source "$HUN_ROOT/lib/check.sh"
+# shellcheck disable=SC1091
+[[ -f "$HUN_ROOT/lib/notify.sh" ]] && source "$HUN_ROOT/lib/notify.sh"
+
+mkdir -p "$HUN_LOGS" 2>/dev/null
+
+# ---------- config ----------
+hun_default_config() {
+  cat > "$HUN_CONFIG" <<'EOF'
+{
+  "interval_seconds": 900,
+  "cooldown_minutes": 60,
+  "thresholds": {
+    "cpu_percent": 85,
+    "mem_percent": 85,
+    "swap_gb": 16,
+    "disk_free_gb": 20,
+    "load_per_core": 2.0
+  },
+  "notify_on_recovery": true
+}
+EOF
+}
+
+hun_ensure_config() {
+  [[ -f "$HUN_CONFIG" ]] || hun_default_config
+  python3 -c "import json; json.load(open('$HUN_CONFIG'))" 2>/dev/null || {
+    echo "hun: config is not valid JSON: $HUN_CONFIG (run: hun config reset)" >&2
+    return 1
+  }
+}
+
+# hun_cfg <dotted.key> -> value on stdout
+hun_cfg() {
+  python3 -c "
+import json,sys
+c=json.load(open('$HUN_CONFIG'))
+v=c
+for k in '$1'.split('.'): v=v[k]
+print(v if not isinstance(v,bool) else str(v).lower())
+"
+}
+
+hun_set_key() {
+  local key="$1" value="$2"
+  HUN_SET_KEY="$key" HUN_SET_VAL="$value" HUN_CONFIG_PATH="$HUN_CONFIG" python3 <<'EOF'
+import json,os
+p=os.environ['HUN_CONFIG_PATH']
+c=json.load(open(p))
+k=os.environ['HUN_SET_KEY']; v=os.environ['HUN_SET_VAL']
+node=c
+parts=k.split('.')
+for part in parts[:-1]: node=node[part]
+leaf=parts[-1]
+old=node[leaf]
+if isinstance(old,bool):
+  assert v in ('true','false'), 'use true|false'
+  node[leaf]=(v=='true')
+elif isinstance(old,int):
+  node[leaf]=int(float(v))
+elif isinstance(old,float):
+  node[leaf]=float(v)
+else:
+  node[leaf]=v
+json.dump(c,open(p,'w'),indent=2)
+print(f"{k}: {old} -> {node[leaf]}")
+EOF
+}
+
+# ---------- state ----------
+hun_ensure_state() {
+  [[ -f "$HUN_STATE" ]] || echo '{"last_alert_at":{},"last_status":"ok","last_run":0,"last_result":"never"}' > "$HUN_STATE"
+}
+
+hun_state_get() {
+  HUN_STATE_KEY="$1" HUN_STATE_PATH="$HUN_STATE" python3 -c "
+import json,os
+s=json.load(open(os.environ['HUN_STATE_PATH']))
+v=s.get(os.environ['HUN_STATE_KEY'],'')
+import sys
+print(json.dumps(v) if isinstance(v,(dict,list)) else v)
+"
+}
+
+hun_state_set() {
+  HUN_STATE_KEY="$1" HUN_STATE_VAL="$2" HUN_STATE_PATH="$HUN_STATE" python3 <<'EOF'
+import json,os
+p=os.environ['HUN_STATE_PATH']
+s=json.load(open(p))
+v=os.environ['HUN_STATE_VAL']
+try: v=json.loads(v)
+except Exception: pass
+s[os.environ['HUN_STATE_KEY']]=v
+json.dump(s,open(p,'w'),indent=2)
+EOF
+}
+
+hun_stamp_alert() {
+  local key="$1" now="$2"
+  HUN_NOW="$now" HUN_KEY="$key" HUN_STATE_PATH="$HUN_STATE" python3 <<'EOF'
+import json,os
+p=os.environ['HUN_STATE_PATH']
+s=json.load(open(p))
+s.setdefault('last_alert_at',{})[os.environ['HUN_KEY']]=int(os.environ['HUN_NOW'])
+json.dump(s,open(p,'w'),indent=2)
+EOF
+}
+
+# ---------- commands ----------
+cmd_help() {
+  cat <<'EOF'
+hun — macOS hardware utilization monitor (alerts via a2h)
+
+Usage:
+  hun status [--json]            Sample now, show table vs thresholds (no notify)
+  hun check [--force] [--json] [--note TEXT]
+                                 Sample; notify via a2h on breach (or always w/ --force)
+  hun config show                Show effective config + paths
+  hun config set <key> <value>   Set threshold/setting (see below)
+  hun config reset               Restore defaults
+  hun install [--interval SEC]   Install the launchd agent (~every 15 min default)
+  hun uninstall [--purge]        Remove the agent (--purge deletes ~/.macos-hun too)
+  hun test-notify                Send one real a2h message (proves wiring)
+  hun remind-at "<HH:MM|YYYY-MM-DD HH:MM>" [--note TEXT]
+                                 One-shot status message at TIME, whatever the readings
+  hun remind-list                List pending one-shot reminders
+  hun remind-cancel <id|all>     Cancel pending reminder(s)
+  hun logs [-f]                  Tail the launchd agent logs
+
+Config keys: cpu_percent mem_percent swap_gb disk_free_gb load_per_core
+             interval_seconds cooldown_minutes notify_on_recovery
+EOF
+}
+
+cmd_status() {
+  local json=0
+  [[ "${1:-}" == "--json" ]] && json=1
+  hun_ensure_config || return 1
+  hun_ensure_state
+  hun_collect || { echo "hun: sampling failed" >&2; return 1; }
+  hun_breach_list
+  local loaded="no" last_run next_run
+  launchctl list 2>/dev/null | grep -q "$HUN_LABEL" && loaded="yes"
+  last_run="$(hun_state_get last_run)"
+  if [[ "$last_run" =~ ^[0-9]+$ && "$last_run" -gt 0 ]]; then
+    last_run="$(date -r "$last_run" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$last_run")"
+    next_run="$(python3 -c "print('~')")$(( $(hun_cfg interval_seconds) / 60 )) min after last run (approx)"
+  else
+    last_run="never"; next_run="after install"
+  fi
+  if [[ $json -eq 1 ]]; then
+    cat <<EOF
+{"host":"$HUN_HOST","time":"$HUN_TIME","cpu_pct":$HUN_CPU,"mem_pct":$HUN_MEM_PCT,"mem_used_gb":$HUN_MEM_USED_GB,"mem_total_gb":$HUN_MEM_TOTAL_GB,"swap_gb":$HUN_SWAP_GB,"disk_free_gb":$HUN_DISK_FREE_GB,"disk_pct":$HUN_DISK_PCT,"load_per_core":$HUN_LOAD_PER_CORE,"breaches":$([[ -n "$HUN_BREACHES" ]] && echo true || echo false),"agent_loaded":"$loaded","last_run":"$last_run"}
+EOF
+    return 0
+  fi
+  local line
+  printf '%-10s %-22s %-14s %s\n' "METRIC" "CURRENT" "LIMIT" "STATE"
+  while IFS='|' read -r key label cur lim; do
+    [[ -z "$key" ]] && continue
+    printf '%-10s %-22s %-14s %s\n' "$label" "$cur" "$lim" "🔴 BREACH"
+  done <<< "$(printf '%s' "$HUN_BREACHES")"
+  [[ -n "$HUN_OK_LINE" ]] && echo "OK: $HUN_OK_LINE"
+  echo "Top CPU: ${HUN_TOP_CPU:-n/a}"
+  echo "Top MEM: ${HUN_TOP_MEM:-n/a}"
+  echo "Agent loaded: $loaded · Last run: $last_run · Next: $next_run"
+}
+
+cmd_check() {
+  local force=0 json=0 note="" reminder_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --json) json=1; shift ;;
+      --note) note="${2:-}"; shift 2 ;;
+      --reminder-id) reminder_id="${2:-}"; shift 2 ;;
+      *) echo "hun: unknown flag: $1" >&2; return 1 ;;
+    esac
+  done
+  hun_ensure_config || return 1
+  hun_ensure_state
+  hun_collect || { echo "hun: sampling failed" >&2; return 1; }
+  hun_breach_list
+  local now cooldown_sec notified=0 mode="" result="ok"
+  now="$(date +%s)"
+  cooldown_sec=$(( $(hun_cfg cooldown_minutes) * 60 ))
+
+  if [[ $force -eq 1 ]]; then
+    mode="forced"
+    hun_build_message forced "$note"
+    [[ $json -eq 1 ]] && { echo "{\"forced\":true,\"message\":$(printf '%s' "$HUN_MSG" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"; }
+    hun_send_message || return $?
+    notified=1; result="forced"
+    # NOTE: forced sends never stamp the cooldown (review #7).
+  elif [[ -n "$HUN_BREACHES" ]]; then
+    # Send only if some breached metric is past its cooldown.
+    local send=0 key last
+    while IFS='|' read -r key _label _cur _lim; do
+      [[ -z "$key" ]] && continue
+      last="$(HUN_STATE_KEY="last_alert_at" HUN_STATE_PATH="$HUN_STATE" python3 -c "
+import json,os; s=json.load(open(os.environ['HUN_STATE_PATH'])); print(s.get('last_alert_at',{}).get('$key',0))")"
+      if [[ $((now - last)) -ge $cooldown_sec ]]; then send=1; fi
+    done <<< "$(printf '%s' "$HUN_BREACHES")"
+    if [[ $send -eq 1 ]]; then
+      mode="breach"
+      hun_build_message breach "$note"
+      hun_send_message || return $?
+      notified=1
+      while IFS='|' read -r key _l _c _m; do
+        [[ -z "$key" ]] && continue
+        hun_stamp_alert "$key" "$now"
+      done <<< "$(printf '%s' "$HUN_BREACHES")"
+      result="breach"
+    else
+      result="suppressed (cooldown)"
+    fi
+    hun_state_set last_status '"breach"'
+  else
+    local prev
+    prev="$(hun_state_get last_status)"
+    if [[ "$prev" == "breach" && "$(hun_cfg notify_on_recovery)" == "true" ]]; then
+      mode="recovery"
+      hun_build_message recovery "$note"
+      hun_send_message || return $?
+      notified=1; result="recovered"
+    fi
+    hun_state_set last_status '"ok"'
+    # Clear per-metric stamps on recovery so the next breach alerts fresh.
+    hun_state_set last_alert_at '{}'
+  fi
+
+  hun_state_set last_run "$now"
+  hun_state_set last_result "\"$result\""
+
+  # One-shot reminder self-cleanup (best effort; remind-list prunes the rest).
+  if [[ -n "$reminder_id" ]]; then
+    local plist="$HUN_AGENT_DIR/${HUN_LABEL}.remind.${reminder_id}.plist"
+    launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null
+    rm -f "$plist" 2>/dev/null
+  fi
+
+  if [[ $json -eq 1 && $force -eq 0 ]]; then
+    echo "{\"breach\":$([[ -n \"$HUN_BREACHES\" ]] && echo true || echo false),\"notified\":$([[ $notified -eq 1 ]] && echo true || echo false),\"result\":\"$result\"}"
+  elif [[ $json -eq 0 ]]; then
+    [[ -n "$mode" ]] && echo "hun: sent $mode notification via a2h."
+    [[ -z "$mode" ]] && echo "hun: $result — no notification."
+  fi
+  return 0
+}
+
+cmd_config() {
+  local sub="${1:-}"; shift || true
+  hun_ensure_config || return 1
+  case "$sub" in
+    show)
+      python3 -c "import json; print(json.dumps(json.load(open('$HUN_CONFIG')),indent=2))"
+      echo "---"
+      echo "config: $HUN_CONFIG"
+      echo "state:  $HUN_STATE"
+      echo "logs:   $HUN_LOGS"
+      if launchctl list 2>/dev/null | grep -q "$HUN_LABEL"; then echo "agent:  loaded"; else echo "agent:  not loaded (run: hun install)"; fi
+      ;;
+    set)
+      local key="${1:-}" value="${2:-}"
+      [[ -z "$key" || -z "$value" ]] && { echo "hun: usage: hun config set <key> <value>" >&2; return 1; }
+      case "$key" in
+        cpu|cpu_percent) key="thresholds.cpu_percent" ;;
+        mem|mem_percent) key="thresholds.mem_percent" ;;
+        swap|swap_gb) key="thresholds.swap_gb" ;;
+        disk_free|disk_free_gb) key="thresholds.disk_free_gb" ;;
+        load|load_per_core) key="thresholds.load_per_core" ;;
+        interval|interval_seconds) key="interval_seconds" ;;
+        cooldown|cooldown_minutes) key="cooldown_minutes" ;;
+        recover|notify_on_recovery) key="notify_on_recovery" ;;
+        thresholds.*) ;;
+        *) echo "hun: unknown key: $key" >&2; cmd_help >&2; return 1 ;;
+      esac
+      hun_set_key "$key" "$value" || { echo "hun: invalid value for $key: $value" >&2; return 1; }
+      # Keep the agent's cadence in sync when the interval changes.
+      if [[ "$key" == "interval_seconds" ]] && launchctl list 2>/dev/null | grep -q "$HUN_LABEL"; then
+        cmd_install >/dev/null && echo "hun: agent reinstalled with new interval."
+      fi
+      ;;
+    reset)
+      hun_default_config && echo "hun: defaults restored."
+      ;;
+    *) echo "hun: usage: hun config {show|set|reset}" >&2; return 1 ;;
+  esac
+}
+
+cmd_install() {
+  local interval=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --interval) interval="${2:-}"; shift 2 ;; *) shift ;; esac
+  done
+  hun_ensure_config || return 1
+  [[ -n "$interval" ]] && hun_set_key interval_seconds "$interval" >/dev/null
+  interval="$(hun_cfg interval_seconds)"
+  local plist="$HUN_AGENT_DIR/${HUN_LABEL}.plist" template="$HUN_ROOT/launchd/dev.macos-hun.plist.template"
+  [[ -f "$template" ]] || { echo "hun: missing template: $template" >&2; return 1; }
+  mkdir -p "$HUN_AGENT_DIR" "$HUN_LOGS"
+  sed -e "s|__HUN_BIN__|$HUN_BIN|g" -e "s|__INTERVAL__|$interval|g" \
+      -e "s|__HUN_LOGS__|$HUN_LOGS|g" "$template" > "$plist"
+  launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$plist" || { echo "hun: bootstrap failed" >&2; return 1; }
+  echo "hun: agent installed — checking every $((interval/60)) min. Logs: $HUN_LOGS"
+}
+
+cmd_uninstall() {
+  local purge=0
+  [[ "${1:-}" == "--purge" ]] && purge=1
+  local plist="$HUN_AGENT_DIR/${HUN_LABEL}.plist"
+  launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null
+  rm -f "$plist"
+  # Leave fired/pending one-shots alone unless purging? No — remove agent's
+  # one-shots too; they're ours.
+  for p in "$HUN_AGENT_DIR"/${HUN_LABEL}.remind.*.plist; do
+    [[ -f "$p" ]] || continue
+    launchctl bootout "gui/$(id -u)" "$p" 2>/dev/null
+    rm -f "$p"
+  done
+  if [[ $purge -eq 1 ]]; then
+    rm -rf "$HUN_DIR"
+    echo "hun: agent removed and $HUN_DIR deleted."
+  else
+    echo "hun: agent removed (config kept in $HUN_DIR; --purge to delete)."
+  fi
+}
+
+cmd_test_notify() {
+  hun_ensure_config || return 1
+  hun_collect || { echo "hun: sampling failed" >&2; return 1; }
+  hun_breach_list
+  hun_build_message forced "🧪 Test — wiring check, safe to ignore."
+  echo "Sending test message via a2h…"
+  hun_send_message || return $?
+  echo "hun: test message sent. Check your a2h destination."
+}
+
+cmd_remind_at() {
+  local when="" note=""
+  # Parse: first non-flag arg is the time; --note TEXT anywhere.
+  local args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --note) note="${2:-}"; shift 2 ;; *) args+=("$1"); shift ;; esac
+  done
+  when="${args[0]:-}"
+  [[ -z "$when" ]] && { echo 'hun: usage: hun remind-at "<HH:MM|YYYY-MM-DD HH:MM>" [--note TEXT]' >&2; return 1; }
+
+  local Y M D h m fire_epoch now_human
+  if [[ "$when" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}$ ]]; then
+    fire_epoch="$(date -j -f '%Y-%m-%d %H:%M' "$when" '+%s' 2>/dev/null)" || { echo "hun: can't parse time: $when" >&2; return 1; }
+    if [[ "$fire_epoch" -le "$(date +%s)" ]]; then echo "hun: that time is in the past: $when" >&2; return 1; fi
+    now_human="$when"
+  elif [[ "$when" =~ ^[0-9]{2}:[0-9]{2}$ ]]; then
+    fire_epoch="$(date -j -f '%Y-%m-%d %H:%M' "$(date '+%Y-%m-%d') $when" '+%s' 2>/dev/null)" || { echo "hun: can't parse time: $when" >&2; return 1; }
+    if [[ "$fire_epoch" -le "$(date +%s)" ]]; then
+      fire_epoch="$(date -j -v+1d -f '%Y-%m-%d %H:%M' "$(date '+%Y-%m-%d') $when" '+%s' 2>/dev/null)"
+      now_human="tomorrow $when (today already passed)"
+    else
+      now_human="today $when"
+    fi
+  else
+    echo 'hun: use HH:MM or "YYYY-MM-DD HH:MM"' >&2; return 1
+  fi
+  Y="$(date -j -r "$fire_epoch" '+%Y')"; M="$(date -j -r "$fire_epoch" '+%-m')"
+  D="$(date -j -r "$fire_epoch" '+%-d')"; h="$(date -j -r "$fire_epoch" '+%-H')"
+  m="$(date -j -r "$fire_epoch" '+%-M')"
+
+  local id plist
+  id="$fire_epoch"; plist="$HUN_AGENT_DIR/${HUN_LABEL}.remind.${id}.plist"
+  mkdir -p "$HUN_AGENT_DIR" "$HUN_LOGS"
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    echo '<plist version="1.0"><dict>'
+    echo "  <key>Label</key><string>${HUN_LABEL}.remind.${id}</string>"
+    echo '  <key>ProgramArguments</key><array>'
+    echo "    <string>$HUN_BIN</string><string>check</string><string>--force</string>"
+    [[ -n "$note" ]] && echo "    <string>--note</string><string>$note</string>"
+    echo "    <string>--reminder-id</string><string>$id</string>"
+    echo '  </array>'
+    echo '  <key>StartCalendarInterval</key><dict>'
+    echo "    <key>Year</key><integer>$Y</integer>"
+    echo "    <key>Month</key><integer>$M</integer>"
+    echo "    <key>Day</key><integer>$D</integer>"
+    echo "    <key>Hour</key><integer>$h</integer>"
+    echo "    <key>Minute</key><integer>$m</integer>"
+    echo '  </dict>'
+    echo "  <key>StandardOutPath</key><string>$HUN_LOGS/remind.$id.out.log</string>"
+    echo "  <key>StandardErrorPath</key><string>$HUN_LOGS/remind.$id.err.log</string>"
+    echo '</dict></plist>'
+  } > "$plist"
+  launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$plist" || { echo "hun: could not schedule reminder" >&2; rm -f "$plist"; return 1; }
+  echo "hun: reminder set for $now_human (id $id) — you'll get the full status even if all clear."
+}
+
+cmd_remind_list() {
+  local found=0 now p id fire
+  now="$(date +%s)"
+  for p in "$HUN_AGENT_DIR"/${HUN_LABEL}.remind.*.plist; do
+    [[ -f "$p" ]] || continue
+    id="$(basename "$p" | sed -E 's/.*remind\.([0-9]+)\.plist/\1/')"
+    if [[ "$id" =~ ^[0-9]+$ ]] && [[ "$id" -le "$now" ]]; then
+      # Past or fired: prune.
+      launchctl bootout "gui/$(id -u)" "$p" 2>/dev/null
+      rm -f "$p" 2>/dev/null
+      continue
+    fi
+    fire="$(date -j -r "$id" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$id")"
+    local note
+    note="$(sed -n 's/.*<string>--note<\/string><string>\(.*\)<\/string>.*/\1/p' "$p" 2>/dev/null | head -1)"
+    echo "id $id · $fire${note:+ · $note}"
+    found=1
+  done
+  [[ $found -eq 0 ]] && echo "hun: no pending reminders."
+}
+
+cmd_remind_cancel() {
+  local target="${1:-}"
+  [[ -z "$target" ]] && { echo "hun: usage: hun remind-cancel <id|all>" >&2; return 1; }
+  local p count=0
+  for p in "$HUN_AGENT_DIR"/${HUN_LABEL}.remind.*.plist; do
+    [[ -f "$p" ]] || continue
+    if [[ "$target" == "all" || "$p" == *".$target.plist" ]]; then
+      launchctl bootout "gui/$(id -u)" "$p" 2>/dev/null
+      rm -f "$p" && count=$((count+1))
+    fi
+  done
+  echo "hun: cancelled $count reminder(s)."
+}
+
+cmd_logs() {
+  if [[ "${1:-}" == "-f" ]]; then
+    tail -f "$HUN_LOGS"/hun.*.log 2>/dev/null || echo "hun: no logs yet."
+  else
+    tail -n 50 "$HUN_LOGS"/hun.*.log 2>/dev/null || echo "hun: no logs yet ($HUN_LOGS)."
+  fi
+}
+
+# ---------- dispatch ----------
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  ""|-h|--help|help) cmd_help ;;
+  status) cmd_status "$@" ;;
+  check) cmd_check "$@" ;;
+  config) cmd_config "$@" ;;
+  install) cmd_install "$@" ;;
+  uninstall) cmd_uninstall "$@" ;;
+  test-notify) cmd_test_notify ;;
+  remind-at) cmd_remind_at "$@" ;;
+  remind-list) cmd_remind_list ;;
+  remind-cancel) cmd_remind_cancel "$@" ;;
+  logs) cmd_logs "$@" ;;
+  *) echo "hun: unknown command: $cmd" >&2; cmd_help >&2; exit 1 ;;
+esac
