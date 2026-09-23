@@ -39,13 +39,31 @@ hun_default_config() {
     "disk_free_gb": 20,
     "load_per_core": 2.0
   },
-  "notify_on_recovery": true
+  "notify_on_recovery": true,
+  "log_retention_days": 90
 }
 EOF
 }
 
 hun_ensure_config() {
   [[ -f "$HUN_CONFIG" ]] || hun_default_config
+  # Backfill keys added by newer versions (keeps existing user values).
+  HUN_CONFIG_PATH="$HUN_CONFIG" python3 <<'EOF' 2>/dev/null
+import json,os
+p=os.environ['HUN_CONFIG_PATH']
+try: c=json.load(open(p))
+except Exception: raise SystemExit
+defaults={"interval_seconds":900,"cooldown_minutes":60,"notify_on_recovery":True,
+  "log_retention_days":90,
+  "thresholds":{"cpu_percent":85,"mem_percent":85,"swap_gb":16,"disk_free_gb":20,"load_per_core":2.0}}
+changed=False
+for k,v in defaults.items():
+  if k not in c: c[k]=v; changed=True
+  elif isinstance(v,dict):
+    for k2,v2 in v.items():
+      if k2 not in c[k]: c[k][k2]=v2; changed=True
+if changed: json.dump(c,open(p,'w'),indent=2)
+EOF
   python3 -c "import json; json.load(open('$HUN_CONFIG'))" 2>/dev/null || {
     echo "hun: config is not valid JSON: $HUN_CONFIG (run: hun config reset)" >&2
     return 1
@@ -148,9 +166,12 @@ Usage:
   hun remind-list                List pending one-shot reminders
   hun remind-cancel <id|all>     Cancel pending reminder(s)
   hun logs [-f]                  Tail the launchd agent logs
+  hun history [--limit N] [--json] [--purge]
+                                 Show recent check runs (JSONL log)
 
 Config keys: cpu_percent mem_percent swap_gb disk_free_gb load_per_core
              interval_seconds cooldown_minutes notify_on_recovery
+             log_retention_days (1-365, how long check history is kept)
 EOF
 }
 
@@ -254,6 +275,9 @@ import json,os; s=json.load(open(os.environ['HUN_STATE_PATH'])); print(s.get('la
   hun_state_set last_run "$now"
   hun_state_set last_result "\"$result\""
 
+  # Log every run to ~/.macos-hun/logs/checks.jsonl (with daily TTL prune).
+  hun_log_check "$(printf '%s' "$HUN_BREACHES" | cut -d'|' -f1 | grep . | paste -sd, -)" "$notified" "$result" "$now"
+
   # One-shot reminder self-cleanup (best effort; remind-list prunes the rest).
   if [[ -n "$reminder_id" ]]; then
     local plist="$HUN_AGENT_DIR/${HUN_LABEL}.remind.${reminder_id}.plist"
@@ -294,6 +318,7 @@ cmd_config() {
         interval|interval_seconds) key="interval_seconds" ;;
         cooldown|cooldown_minutes) key="cooldown_minutes" ;;
         recover|notify_on_recovery) key="notify_on_recovery" ;;
+        retention|log_retention_days) key="log_retention_days" ;;
         thresholds.*) ;;
         *) echo "hun: unknown key: $key" >&2; cmd_help >&2; return 1 ;;
       esac
@@ -453,6 +478,108 @@ cmd_remind_cancel() {
   echo "hun: cancelled $count reminder(s)."
 }
 
+hun_log_check() {
+  # Append one JSONL line per check run (~350 bytes/line, ~35 KB/day at 15-min
+  # cadence). TTL-pruned by hun_prune_logs so it can't grow forever.
+  local breach_keys="$1" notified="$2" result="$3" now="$4"
+  HUN_HOST_X="$HUN_HOST" HUN_CPU_X="$HUN_CPU" HUN_MEM_X="$HUN_MEM_PCT" \
+  HUN_MEM_USED_X="$HUN_MEM_USED_GB" HUN_SWAP_X="$HUN_SWAP_GB" HUN_DISK_X="$HUN_DISK_FREE_GB" \
+  HUN_LOAD_X="$HUN_LOAD_PER_CORE" HUN_LOG_NOW="$now" HUN_LOG_BREACHES="$breach_keys" \
+  HUN_LOG_NOTIFIED="$notified" HUN_LOG_RESULT="$result" HUN_LOG_DRY="${HUN_DRY_RUN:-0}" \
+  HUN_LOGS_DIR="$HUN_LOGS" python3 <<'EOF'
+import json,os,datetime
+entry={
+  "ts": int(os.environ['HUN_LOG_NOW']),
+  "time": datetime.datetime.fromtimestamp(int(os.environ['HUN_LOG_NOW'])).strftime('%Y-%m-%d %H:%M'),
+  "host": os.environ.get('HUN_HOST_X',''),
+  "cpu_pct": int(os.environ.get('HUN_CPU_X','-1')),
+  "mem_pct": int(os.environ.get('HUN_MEM_X','-1')),
+  "mem_used_gb": float(os.environ.get('HUN_MEM_USED_X','-1')),
+  "swap_gb": float(os.environ.get('HUN_SWAP_X','-1')),
+  "disk_free_gb": int(float(os.environ.get('HUN_DISK_X','-1'))),
+  "load_per_core": float(os.environ.get('HUN_LOAD_X','-1')),
+  "breaches": [b for b in os.environ['HUN_LOG_BREACHES'].split(',') if b],
+  "notified": os.environ['HUN_LOG_NOTIFIED']=='1',
+  "result": os.environ['HUN_LOG_RESULT'],
+  "dry_run": os.environ['HUN_LOG_DRY']=='1',
+}
+with open(os.path.join(os.environ['HUN_LOGS_DIR'],'checks.jsonl'),'a') as f:
+  f.write(json.dumps(entry)+'\n')
+EOF
+  hun_prune_logs "$now"
+}
+
+hun_prune_logs() {
+  # TTL: drop entries older than log_retention_days. Runs at most once a day
+  # (tracked in state) so the steady-state 15-min path stays a pure append.
+  local now="$1" last_prune retention
+  last_prune="$(hun_state_get last_prune)"; last_prune="${last_prune:-0}"
+  if [[ "$last_prune" =~ ^[0-9]+$ ]] && [[ $((now - last_prune)) -lt 86400 ]]; then return 0; fi
+  retention="$(hun_cfg log_retention_days 2>/dev/null || echo 90)"
+  [[ "$retention" =~ ^[0-9]+$ ]] || retention=90
+  [[ "$retention" -lt 1 ]] && retention=1
+  HUN_PRUNE_NOW="$now" HUN_PRUNE_DAYS="$retention" HUN_LOGS_DIR="$HUN_LOGS" python3 <<'EOF'
+import json,os
+p=os.path.join(os.environ['HUN_LOGS_DIR'],'checks.jsonl')
+cutoff=int(os.environ['HUN_PRUNE_NOW'])-int(os.environ['HUN_PRUNE_DAYS'])*86400
+try:
+  lines=open(p).readlines()
+except FileNotFoundError:
+  lines=[]
+def fresh(line):
+  try:
+    d=json.loads(line)
+    return isinstance(d,dict) and d.get('ts',0)>=cutoff
+  except Exception:
+    return True
+kept=[l for l in lines if not l.strip() or fresh(l)]
+if len(kept)!=len(lines):
+  tmp=p+'.tmp'
+  open(tmp,'w').writelines(kept)
+  os.replace(tmp,p)
+EOF
+  hun_state_set last_prune "$now"
+}
+
+cmd_history() {
+  local limit=20 json=0 purge=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit) limit="${2:-20}"; shift 2 ;;
+      --json) json=1; shift ;;
+      --purge) purge=1; shift ;;
+      *) echo "hun: usage: hun history [--limit N] [--json] [--purge]" >&2; return 1 ;;
+    esac
+  done
+  local log="$HUN_LOGS/checks.jsonl"
+  if [[ $purge -eq 1 ]]; then
+    rm -f "$log" && echo "hun: check history purged." && return 0
+  fi
+  [[ -f "$log" ]] || { echo "hun: no history yet."; return 0; }
+  if [[ $json -eq 1 ]]; then
+    tail -n "$limit" "$log"
+  else
+    HUN_HIST_LIMIT="$limit" python3 - "$log" <<'EOF'
+import json,os,sys
+limit=int(os.environ['HUN_HIST_LIMIT'])
+rows=[]
+for line in open(sys.argv[1]):
+  line=line.strip()
+  if not line: continue
+  try: rows.append(json.loads(line))
+  except Exception: continue
+rows=rows[-limit:]
+print(f"{'TIME':<17}{'CPU':<6}{'MEM':<6}{'SWAP':<9}{'DISK':<9}{'LOAD':<6}RESULT")
+for r in rows:
+  b=','.join(r.get('breaches',[])) or '-'
+  flag=' (!)' if r.get('notified') else ''
+  dry=' (dry)' if r.get('dry_run') else ''
+  print(f"{r.get('time','?'):<17}{str(r.get('cpu_pct'))+'%':<6}{str(r.get('mem_pct'))+'%':<6}{str(r.get('swap_gb'))+'G':<9}{str(r.get('disk_free_gb'))+'G':<9}{str(r.get('load_per_core')):<6}{r.get('result','')}{flag}[{b}]{dry}")
+print(f"\n{len(rows)} run(s) shown \u00b7 {sys.argv[1]}")
+EOF
+  fi
+}
+
 cmd_logs() {
   if [[ "${1:-}" == "-f" ]]; then
     tail -f "$HUN_LOGS"/hun.*.log 2>/dev/null || echo "hun: no logs yet."
@@ -475,5 +602,6 @@ case "$cmd" in
   remind-list) cmd_remind_list ;;
   remind-cancel) cmd_remind_cancel "$@" ;;
   logs) cmd_logs "$@" ;;
+  history) cmd_history "$@" ;;
   *) echo "hun: unknown command: $cmd" >&2; cmd_help >&2; exit 1 ;;
 esac

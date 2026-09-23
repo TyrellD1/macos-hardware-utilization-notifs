@@ -56,6 +56,7 @@ hun remind-list
 hun remind-cancel <id|all>
 
 hun logs                         # what the background agent has been doing
+hun history                      # every check run: metrics, verdict, notified?
 hun uninstall [--purge]          # remove agent (--purge deletes ~/.macos-hun too)
 ```
 
@@ -74,6 +75,7 @@ which). Full dates in the past are rejected.
 | `interval_seconds` | 900 | check every 15 min |
 | `cooldown_minutes` | 60 | re-notify a sustained breach at most hourly |
 | `notify_on_recovery` | true | one quiet ✅ when a breach clears |
+| `log_retention_days` | 90 | how long per-run history is kept |
 
 ## How it works
 
@@ -85,6 +87,11 @@ which). Full dates in the past are rejected.
   `StartCalendarInterval` that clean up after firing.
 - State (`last alert per metric`, `breach→ok` transitions) lives in
   `~/.macos-hun/state.json` so flapping at a threshold doesn't spam you.
+- Every run appends one JSON line to `~/.macos-hun/logs/checks.jsonl`
+  (~350 bytes, ~35 KB/day). Entries older than `log_retention_days` are
+  pruned automatically (at most once a day, so the hot path stays a pure
+  append); `hun history --purge` wipes it manually. Deleting the file is
+  always safe — it's recreated on the next run.
 
 Deliberately skipped: per-core temperature / `powermetrics` (needs sudo), GPU
 stats, network throughput (too noisy on a 15-min cadence).
